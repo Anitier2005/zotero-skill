@@ -37,6 +37,13 @@ Zotero 已有的接入方式各有短板：
 
 `add` / `update` / `delete` / `trash --empty`，覆盖条目、字段、标签、分类归属、子笔记。
 
+**定位与启动**（与读写解耦，随时可用）
+
+| 命令 | 用途 |
+|---|---|
+| `locate` | 报告 Zotero 程序路径、版本、数据目录、API 连通性。只查不启动 |
+| `launch` | 启动 Zotero 并等待本地 API 就绪，最多等 90 秒 |
+
 ## 环境要求
 
 - **Python 3.8+**，只用标准库，无需 pip 安装任何包
@@ -60,20 +67,24 @@ git clone https://github.com/Anitier2005/zotero-skill.git ~/.claude/skills/zoter
 ## 快速开始
 
 ```bash
-# 1. 检查通道状态（写入是否可用）
+# 1. 检查通道状态（程序在哪、写入是否可用）
 python3 scripts/zotquery.py doctor
 
-# 2. 看库是怎么分类的
+# 2. Zotero 没开？定位后启动，脚本会等到 API 真正可读才返回
+python3 scripts/zotquery.py locate
+python3 scripts/zotquery.py launch --yes
+
+# 3. 看库是怎么分类的
 python3 scripts/zotquery.py collections
 
-# 3. 找文献
+# 4. 找文献
 python3 scripts/zotquery.py search "社会流动" --limit 5
 python3 scripts/zotquery.py search 代际 --in abstract --since 2020
 
-# 4. 看详情（元数据、笔记、PDF 批注都在里面）
+# 5. 看详情（元数据、笔记、PDF 批注都在里面）
 python3 scripts/zotquery.py info ABCD1234
 
-# 5. 读正文
+# 6. 读正文
 python3 scripts/zotquery.py text ABCD1234 --max-chars 3000
 ```
 
@@ -111,6 +122,22 @@ $ echo $?
 
 > 注意：Zotero 本地 API 的 `DELETE` 是**永久删除**，与 zotero.org Web API「DELETE = 进回收站」的语义相反。这是本工具在真机测试中发现并修正的关键差异。
 
+## Zotero 没开时如何启动
+
+`launch` 自己会找程序：Windows 读注册表卸载项与 `App Paths`（用 Python 的 `winreg`，不依赖 `reg.exe`）、macOS 找 `/Applications`、Linux 查 `which` 与常见安装目录。定位不到时用 `--exe <路径>` 或环境变量 `ZOTERO_EXE`。
+
+启动入口有个不显然的地方，值得单独记一笔：
+
+| 平台 | 启动方式 | 原因 |
+|---|---|---|
+| Windows | `explorer.exe <exe>` | 用 `Popen` 或 `os.startfile` 启动时，Zotero 会落在调用方的作业对象（Job Object）里，调用方一退出就被连带清理，表现为「API 短暂就绪后立刻断开」。交给资源管理器启动才是独立进程 |
+| macOS | `open -a Zotero.app` | 走 Launch Services，与双击行为一致 |
+| Linux | 直接 exec + `start_new_session` | 脱离会话，父进程退出不受影响 |
+
+顺带一提：`CREATE_BREAKAWAY_FROM_JOB` 在这种场景下会被直接拒绝（WinError 5），所以不能指望它，只能换启动入口。
+
+`launch` 在返回前会轮询本地 API，确认真正可读（默认 90 秒上限）。已经开着时直接提示「已在运行」；Zotero 开着但本地 API 被关掉时，会指出去设置里勾选，而不是再启动一个。
+
 ## 数据目录定位
 
 脚本按以下顺序查找，找不到会列出所有尝试过的候选路径：
@@ -134,7 +161,8 @@ $ echo $?
 - **部分中文 PDF 的全文索引缓存逐字带空格**（PDF 排版所致，非脚本问题）。语义可读，但逐字引用建议打开原 PDF。
 - **本地 API 没有「永久删除单条以外」的批量接口**。批量删除需逐条调用。
 - **回收站中的条目在查命令里默认不可见**，用 `trash` 单独查看。
-- **只在 Zotero 10.0.6 / Windows 上做过完整真机验证**。Linux 与 macOS 路径已按平台差异实现，但未实测。
+- **Windows 下 `launch --minimized` 不保证生效**：启动由资源管理器接管，窗口状态沿用 Zotero 自身设置。
+- **只在 Zotero 10.0.6 / Windows 上做过完整真机验证**。macOS 与 Linux 的查找路径与启动方式已按平台差异实现，但未实测。
 
 ## 项目结构
 
@@ -143,7 +171,8 @@ $ echo $?
 ├── SKILL.md                        # agent 入口：何时触发、命令表、红线、排错
 ├── scripts/
 │   ├── zotquery.py                 # CLI：查询（SQLite 只读快照）+ 写命令
-│   └── zapi.py                     # Zotero 本地 API 客户端（授权、重试、错误码）
+│   ├── zapi.py                     # Zotero 本地 API 客户端（授权、重试、错误码）
+│   └── zlaunch.py                  # 定位并启动 Zotero 程序
 └── references/
     ├── zotero-schema.md            # SQLite 表结构速查（按需加载）
     └── write-protocol.md           # 写入协议与错误码（按需加载）

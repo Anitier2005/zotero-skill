@@ -22,6 +22,13 @@ zotquery.py — 本地 Zotero 文献库只读查询工具。
     info <KEY>                      单条条目完整详情
     text <KEY>                      读取全文索引缓存（或 HTML 快照正文）
     tags                            列出标签及使用频次
+    trash                           查看回收站（--empty 清空）
+
+    locate                          报告 Zotero 程序位置、版本与 API 状态（不启动）
+    launch                          启动 Zotero 并等待本地 API 就绪（需 --yes）
+    doctor                          检查程序、数据目录与写入通道
+
+    add / update / delete           新建、修改、删除条目（写操作，需 --yes）
 
 全局选项
     --data-dir <目录>               指定 Zotero 数据目录（也可直接给 zotero.sqlite 路径）
@@ -41,14 +48,16 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import time
 import unicodedata
 from html.parser import HTMLParser
 
 # 同目录下的本地 API 客户端（写操作走它，绝不直接写 sqlite）
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import zapi  # noqa: E402
+import zlaunch  # noqa: E402
 
-__version__ = "3.0.0"
+__version__ = "3.1.0"
 
 # 非文献条目类型：这些不是用户在库界面里看到的"一篇文献"
 NON_ITEM_TYPES = ("attachment", "note", "annotation")
@@ -1556,9 +1565,18 @@ def cmd_trash(args, conn, data_dir):
 def cmd_doctor(args, conn, data_dir):
     report = zapi.probe(opts_base(args))
     report["dataDir"] = data_dir
+    entry, tried = zlaunch.find(getattr(args, "exe", None))
+    report["program"] = entry
+    if not entry:
+        report["programTried"] = tried
     if args.json:
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return 0 if report.get("ok") else 1
+    if entry:
+        print("Zotero 程序: {}（{}，来源 {}）".format(
+            entry["exe"], entry["version"] or "版本未知", entry["source"]))
+    else:
+        print("Zotero 程序: 未找到（用 --exe 或环境变量 ZOTERO_EXE 指定）")
     print("数据目录: " + str(data_dir))
     if report.get("ok"):
         print("本地 API: 可读（Server-ID={}, API 版本={}）".format(
@@ -1574,11 +1592,135 @@ def cmd_doctor(args, conn, data_dir):
     print("  原因: " + report.get("message", ""))
     if report.get("hint"):
         print("  处理: " + report["hint"])
+    if report.get("stage") == "not_running" and entry:
+        print("  启动: zotquery.py launch --yes（会打开 Zotero 窗口，先征得用户同意）")
+    return 1
+
+
+def cmd_locate(args, data_dir):
+    """只报告 Zotero 程序装在哪，不启动任何东西。"""
+    entry, tried = zlaunch.find(getattr(args, "exe", None))
+    _warn_exe_fallback(args, entry)
+    report = zapi.probe(opts_base(args))
+    if args.json:
+        payload = {
+            "program": entry,
+            "dataDir": data_dir,
+            "api": report,
+            "tried": tried,
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0 if entry else 1
+
+    if entry:
+        print("Zotero 程序: {}".format(entry["exe"]))
+        print("  版本: {}".format(entry["version"] or "未知"))
+        print("  来源: {}".format(entry["source"]))
+    else:
+        print("Zotero 程序: 未找到。已尝试：")
+        for item in tried:
+            print("  - " + item)
+        print("  处理: 用 --exe <绝对路径> 指定，或设置环境变量 ZOTERO_EXE。")
+    print("数据目录: " + str(data_dir))
+    if report.get("ok"):
+        print("本地 API: 可读（Server-ID={}）".format(report.get("serverId") or "无此头"))
+    else:
+        print("本地 API: 不可用（{}）".format(report.get("stage", "unknown")))
+        if entry:
+            print("  启动: zotquery.py launch --yes")
+    return 0 if entry else 1
+
+
+def cmd_launch(args, data_dir):
+    """启动 Zotero 并等本地 API 就绪。启动会打开窗口，因此同样受 --yes 闸门约束。"""
+    report = zapi.probe(opts_base(args))
+
+    if report.get("ok"):
+        print("Zotero 已在运行（Server-ID={}），无需启动。".format(
+            report.get("serverId") or "无此头"))
+        return 0
+
+    if report.get("stage") == "disabled":
+        print("Zotero 已在运行，但本地 API 未启用。")
+        print("  处理: 设置 → 高级 → 勾选「允许其他应用程序在此计算机上与 Zotero 通信」。")
+        return 1
+
+    entry, tried = zlaunch.find(getattr(args, "exe", None))
+    if not entry:
+        print("错误：找不到 Zotero 程序。已尝试：", file=sys.stderr)
+        for item in tried:
+            print("  - " + item, file=sys.stderr)
+        print("可用 --exe <绝对路径> 指定，或设置环境变量 ZOTERO_EXE。", file=sys.stderr)
+        return 2
+    _warn_exe_fallback(args, entry)
+
+    lines = [
+        "将启动 Zotero：",
+        "  {}（{}）".format(entry["exe"], entry["version"] or "版本未知"),
+        "",
+        "启动后会打开 Zotero 窗口，并等待本地 API 就绪（最长 {:.0f} 秒）。".format(
+            args.timeout),
+    ]
+    if args.minimized and zlaunch.IS_WINDOWS:
+        lines.append("注意：Windows 下由资源管理器代启动，最小化不保证生效。")
+    lines.append("")
+    if not write_gate(args, lines, "启动"):
+        return 0 if args.dry_run else 3
+
+    print("正在启动：{}".format(entry["exe"]))
+    try:
+        proc = zlaunch.spawn(entry, minimized=args.minimized)
+    except OSError as exc:
+        print("错误：启动失败 —— {}".format(exc), file=sys.stderr)
+        return 1
+
+    if args.no_wait:
+        print("已发起启动，未等待就绪。")
+        return 0
+
+    print("等待本地 API 就绪（最长 {:.0f} 秒）……".format(args.timeout))
+    api = zapi.LocalApi(base=opts_base(args) or zapi.DEFAULT_BASE, timeout=5)
+    started = time.time()
+    ok, stage, detail = zlaunch.wait_ready(
+        api.ping, timeout=args.timeout, proc=proc)
+    elapsed = time.time() - started
+
+    if ok:
+        print("就绪（耗时 {:.1f} 秒）。Server-ID={}，API 版本={}".format(
+            elapsed, detail.get("serverId") or "无此头", detail.get("apiVersion")))
+        return 0
+
+    if stage == "disabled":
+        print("Zotero 已启动，但本地 API 未启用。")
+        print("  处理: 设置 → 高级 → 勾选「允许其他应用程序在此计算机上与 Zotero 通信」。")
+        return 1
+    if stage == "exited":
+        print("错误：Zotero 启动后立即退出。{}".format(detail), file=sys.stderr)
+        return 1
+
+    print("超时：{:.0f} 秒后本地 API 仍无响应。".format(args.timeout), file=sys.stderr)
+    locks = zlaunch.stale_locks()
+    if locks:
+        print("  检测到 profile 锁文件（Zotero 上次可能异常退出，会让新实例直接退出）：",
+              file=sys.stderr)
+        for path in locks:
+            print("    " + path, file=sys.stderr)
+        print("  确认 Zotero 确实没在运行后，删除该文件再重试。", file=sys.stderr)
+    print("  也可能是首次启动正在升级数据库（会弹对话框，需要在窗口里点确认），", file=sys.stderr)
+    print("  或本地 API 未启用，或启动被安全软件拦截。", file=sys.stderr)
+    print("  排查: zotquery.py doctor", file=sys.stderr)
     return 1
 
 
 def opts_base(args):
     return getattr(args, "api_base", None)
+
+
+def _warn_exe_fallback(args, entry):
+    """--exe 指定了但没生效时说明一句，避免用户误以为用的是自己给的路径。"""
+    hint = getattr(args, "exe", None)
+    if hint and entry and entry.get("source") != "参数 --exe":
+        print("注意：--exe 指定的路径不可用，已改用自动探测结果。", file=sys.stderr)
 
 
 # --------------------------------------------------------------------------
@@ -1691,8 +1833,27 @@ def build_parser():
     add_write_args(p)
     p.add_argument("--empty", action="store_true", help="清空回收站（不可恢复，需 --yes）")
 
-    sub.add_parser("doctor", parents=[common], help="检查本地 API 与写入通道状态").add_argument(
+    doctor = sub.add_parser(
+        "doctor", parents=[common], help="检查程序位置、数据目录与写入通道状态")
+    doctor.add_argument(
         "--api-base", help="本地 API 地址，默认 http://127.0.0.1:23119/api")
+    doctor.add_argument("--exe", help="Zotero 可执行文件路径（自动探测失败时用）")
+
+    locate = sub.add_parser(
+        "locate", parents=[common], help="显示 Zotero 程序装在哪、数据目录在哪")
+    locate.add_argument("--api-base", help="本地 API 地址")
+    locate.add_argument("--exe", help="Zotero 可执行文件路径（自动探测失败时用）")
+
+    launch = sub.add_parser(
+        "launch", parents=[common], help="启动 Zotero 并等本地 API 就绪（需 --yes）")
+    add_write_args(launch)
+    launch.add_argument("--exe", help="Zotero 可执行文件路径（自动探测失败时用）")
+    launch.add_argument("--timeout", type=float, default=90.0,
+                        help="等待本地 API 就绪的秒数，默认 90")
+    launch.add_argument("--minimized", action="store_true",
+                        help="最小化启动（Windows 下由资源管理器代启动，不保证生效）")
+    launch.add_argument("--no-wait", action="store_true",
+                        help="发起启动后立即返回，不等待 API 就绪")
 
     return parser
 
@@ -1712,9 +1873,14 @@ def main(argv=None):
         parser.print_help()
         return 0
 
-    if args.command == "doctor":
+    if args.command in ("doctor", "locate", "launch"):
         data_dir, _ = locate_data_dir(args.data_dir)
-        return cmd_doctor(args, None, data_dir or "(未定位到)")
+        label = data_dir or "(未定位到)"
+        if args.command == "doctor":
+            return cmd_doctor(args, None, label)
+        if args.command == "locate":
+            return cmd_locate(args, label)
+        return cmd_launch(args, label)
 
     data_dir, origin = locate_data_dir(args.data_dir)
     if not data_dir:

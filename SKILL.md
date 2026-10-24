@@ -1,9 +1,9 @@
 ---
 name: zotero-local
-description: Read and edit the user's local Zotero library. Use when asked to find, read, summarize, compare, cite, or quote literature from their own Zotero library (search items, read metadata/abstracts/notes/PDF highlights, locate full text, build reference lists), or to add, modify, tag, file, or delete entries in it. Any create/update/delete requires showing the user a preview and getting explicit approval first. 读写本地 Zotero 文献库：检索、读元数据与摘要、读笔记批注、定位 PDF 全文、生成参考文献，以及新增/修改/打标签/归类/删除条目（写入前必须先让用户确认预览）。
+description: Read and edit the user's local Zotero library. Use when asked to find, read, summarize, compare, cite, or quote literature from their own Zotero library (search items, read metadata/abstracts/notes/PDF highlights, locate full text, build reference lists), or to add, modify, tag, file, or delete entries in it. Also covers locating the Zotero installation and launching Zotero when it isn't running. Any create/update/delete, and any app launch, requires showing the user a preview and getting explicit approval first. 读写本地 Zotero 文献库：检索、读元数据与摘要、读笔记批注、定位 PDF 全文、生成参考文献，以及新增/修改/打标签/归类/删除条目；也可定位 Zotero 安装位置并在其未运行时启动（写入或启动前必须先让用户确认预览）。
 license: MIT
 metadata:
-  version: 3.0.0
+  version: 3.1.0
   requires: Python 3.8+ (standard library only); Zotero 10+ for writes
   platforms: Windows, macOS, Linux
 ---
@@ -34,6 +34,8 @@ python  <skill_dir>\scripts\zotquery.py <命令> [选项]     # Windows
 | `tags` | 标签频次 |
 | `trash` | 查看回收站条目；`--empty` 清空整个回收站 |
 | `delete <KEY>` | 移入回收站；加 `--permanent` 永久删除 |
+| `locate` | Zotero 装在哪、版本、数据目录、API 是否已连通（不启动任何东西） |
+| `launch` | 启动 Zotero 并等本地 API 就绪（需 `--yes`，见「二」） |
 
 全局：`--data-dir` `--json` `--fresh` `--version`。
 
@@ -45,11 +47,32 @@ python  <skill_dir>\scripts\zotquery.py <命令> [选项]     # Windows
 
 ### 前置条件
 
-1. Zotero 正在运行；
+1. Zotero 正在运行（没开就用下面的 `launch`，不要自己拼命令行）；
 2. 设置 → 高级 → 勾选「允许其他应用程序在此计算机上与 Zotero 通信」；
 3. Zotero **10 或更高**（10 之前本地 API 只读）。
 
 先跑 `doctor` 确认通道状态，不要把"连不上"当成"库是空的"。
+
+### Zotero 没开时怎么启动
+
+启动会在屏幕上打开一个窗口，属于会打扰用户的操作，**和写操作一样受确认约束**。不要因为"缺前置条件"就擅自拉起它。
+
+```
+第 1 步：zotquery.py locate      确认程序装在哪、API 是否已经通
+第 2 步：zotquery.py launch      只输出启动预览，不加 --yes 不会启动（退出码 3）
+第 3 步：用户明确同意后，加 --yes 执行
+```
+
+`launch` 自己会定位程序，不用先告诉它路径：Windows 读注册表与 `App Paths`、macOS 找 `/Applications`、Linux 查 `which` 与常见目录；定位不到时用 `--exe <绝对路径>` 或环境变量 `ZOTERO_EXE` 指定。
+
+启动后默认最多等 **90 秒**（`--timeout` 可调），等到本地 API 真正可读才返回，所以不需要自己再 sleep 或轮询。想立即返回用 `--no-wait`。
+
+几个边界要知道：
+
+- 已经开着时 `launch` 直接提示"已在运行"，不会重复启动；
+- Zotero 开着但本地 API 被关掉时，`launch` 会指出去设置里勾选，而不是再启动一个；
+- Windows 下启动由资源管理器接管，Zotero 是独立进程，脚本退出后继续运行（已实测）；
+- `--minimized` 在 Windows 下不保证生效，其他平台有效。
 
 ### 强制流程（不可跳过）
 
@@ -105,7 +128,9 @@ zotquery.py trash --empty
 |---|---|
 | `无法定位 Zotero 数据目录` | `--data-dir "<绝对路径>"` 或设 `ZOTERO_DATA_DIR`；脚本会列出尝试过的候选 |
 | 刚加的条目查不到 | 快照按 mtime/size 复用，正常会自动重建；仍查不到用 `--fresh` |
-| 写入报 `连不上本地 API` | Zotero 没启动 |
+| 写入报 `连不上本地 API` | Zotero 没启动；先 `locate` 确认程序位置，再 `launch --yes` 启动 |
+| `locate` 报未找到程序 | 用 `--exe <路径>` 或环境变量 `ZOTERO_EXE` 指定；`locate` 会列出所有探测过的位置 |
+| `launch` 超时 | 首次启动可能在升级数据库（会弹对话框要用户点确认）；若输出提示 `parent.lock` 残留，确认 Zotero 确实没在跑后删除该文件 |
 | 写入报 `403 / 本地 API 未启用` | 设置 → 高级 → 勾选「允许其他应用程序…」 |
 | 写入报 `404/405，需 Zotero 10+` | 当前是 Zotero 9 及更早，升级后才能写 |
 | 写入报 `412 已被其他程序修改` | 条目在此期间被改过；重新读取再试，别硬覆盖 |
